@@ -1,0 +1,48 @@
+name: maxru-platform
+label: MAX.ru
+kind: platform
+version: 1.0.1
+description: >
+  Hermes gateway adapter for the MAX.ru messenger Bot API.
+  Receives updates via Long Polling (development) or Webhook (production)
+  and sends messages via POST /messages. Supports text, images, files,
+  inline keyboards, and home-channel cron delivery.
+author: m0rtal
+requires_env:
+  - name: MAXRU_TOKEN
+    description: "Bot token from Master Bot (https://max.ru/masterbot)"
+    prompt: "MAX.ru bot token"
+    password: true
+optional_env:
+  - name: MAXRU_API_URL
+    description: "MAX API endpoint. Default: https://platform-api2.max.ru"
+    prompt: "MAX API URL"
+    password: false
+  - name: MAXRU_ALLOWED_USERS
+    description: "Comma-separated user IDs allowed to talk to the bot"
+    prompt: "Allowed users (comma-separated)"
+    password: false
+  - name: MAXRU_ALLOW_ALL_USERS
+    description: "Allow any MAX user to trigger the bot (dev only)"
+    prompt: "Allow all users? (true/false)"
+    password: false
+  - name: MAXRU_HOME_CHANNEL
+    description: "Default chat_id for cron / notification delivery"
+    prompt: "Home channel/chat_id"
+    password: false
+  - name: MAXRU_LONG_POLLING
+    description: "Use GET /updates long polling instead of webhook (default: true for dev)"
+    prompt: "Use long polling? (true/false)"
+    password: false
+  - name: MAXRU_WEBHOOK_URL
+    description: "HTTPS URL for production webhook (POST /subscriptions)"
+    prompt: "Webhook HTTPS URL"
+    password: false
+  - name: MAXRU_UPDATE_TIMEOUT
+    description: "Long-polling timeout in seconds (default: 30)"
+    prompt: "Polling timeout"
+    password: false
+  - name: MAXRU_RPS_LIMIT
+    description: "Max requests per second to platform-api2.max.ru (default: 25)"
+    prompt: "RPS limit"
+    password: false

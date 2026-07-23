@@ -95,6 +95,8 @@ def _build_adapter(config: PlatformConfig) -> "MaxruAdapter":
 
 def _is_connected(config) -> bool:
     token = getattr(config, "token", None)
+    if not token and hasattr(config, "extra"):
+        token = (config.extra or {}).get("token")
     if not token:
         token = os.getenv("MAXRU_TOKEN", "")
     return bool(str(token).strip())
@@ -110,6 +112,7 @@ def _env_enablement() -> Optional[dict]:
         "api_url": os.getenv("MAXRU_API_URL", "https://platform-api2.max.ru"),
         "allowed_users": _parse_id_list(os.getenv("MAXRU_ALLOWED_USERS", "")),
         "allow_all_users": os.getenv("MAXRU_ALLOW_ALL_USERS", "").lower() in ("1", "true", "yes"),
+        "join_pin": os.getenv("MAXRU_JOIN_PIN", "").strip(),
         "home_channel": os.getenv("MAXRU_HOME_CHANNEL"),
         "long_polling": os.getenv("MAXRU_LONG_POLLING", "true").lower() in ("1", "true", "yes"),
         "webhook_url": os.getenv("MAXRU_WEBHOOK_URL"),
@@ -164,6 +167,10 @@ class MaxruAdapter(BasePlatformAdapter):
         self.api_url: str = extra.get("api_url", "https://platform-api2.max.ru").rstrip("/")
         self.allowed_users: set[str] = set(extra.get("allowed_users", []))
         self.allow_all_users: bool = bool(extra.get("allow_all_users", False))
+        # join_pin is deprecated; authorization now goes through hermes pairing
+        # (PairingStore). Kept as a no-op attribute so old config.yaml entries
+        # don't crash the adapter.
+        self.join_pin: str = str(extra.get("join_pin", os.getenv("MAXRU_JOIN_PIN", ""))).strip()
         self.home_channel: Optional[str] = extra.get("home_channel")
         self.long_polling: bool = bool(extra.get("long_polling", True))
         self.webhook_url: Optional[str] = extra.get("webhook_url")
@@ -178,25 +185,49 @@ class MaxruAdapter(BasePlatformAdapter):
         self._rate_tokens = self.rps_limit
         self._rate_last = time.monotonic()
 
+    MAX_MESSAGE_LENGTH = 4000
+    splits_long_messages: bool = True
+    SUPPORTS_MESSAGE_EDITING: bool = False
+
+    def _persist_allowed_users(self) -> None:
+        """Persist the current allowed_users set to config.yaml."""
+        try:
+            import subprocess, os
+            value = ",".join(sorted(self.allowed_users))
+            env = {**os.environ, "HERMES_HOME": "/root/.hermes"}
+            subprocess.run(
+                ["hermes", "config", "set", "maxru.allowed_users", value],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=10,
+                check=False,
+            )
+        except Exception as e:
+            logger.warning("maxru: failed to persist allowed_users: %s", e)
+
     # --------------------------------------------------------------------- #
     # Lifecycle
     # --------------------------------------------------------------------- #
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         aiohttp = _import_aiohttp()
+        logger.warning("maxru: connect() called; token present=%s is_reconnect=%s", bool(self.token), is_reconnect)
         if not self.token:
             logger.error("maxru: MAXRU_TOKEN not set")
             return False
 
+        connector = aiohttp.TCPConnector(verify_ssl=False)
         self._session = aiohttp.ClientSession(
             headers={"Authorization": self.token},
             timeout=aiohttp.ClientTimeout(total=60),
+            connector=connector,
         )
 
         # Verify token with /me
         try:
             me = await self._api_get("/me")
-            logger.info("maxru: connected as %s", me.get("username", me.get("user_id")))
+            logger.warning("maxru: /me ok: username=%s user_id=%s", me.get("username"), me.get("user_id"))
         except MaxruAPIError as e:
             logger.error("maxru: /me failed: %s", e)
             return False
@@ -207,6 +238,7 @@ class MaxruAdapter(BasePlatformAdapter):
         elif self.webhook_url:
             await self._register_webhook()
 
+        logger.warning("maxru: connect() finished successfully; long_polling=%s", self.long_polling)
         return True
 
     async def disconnect(self) -> None:
@@ -231,14 +263,24 @@ class MaxruAdapter(BasePlatformAdapter):
             try:
                 params: dict[str, Any] = {"limit": 100, "timeout": self.update_timeout}
                 if self._last_update_id is not None:
-                    params["offset"] = self._last_update_id + 1
+                    params["marker"] = self._last_update_id
 
-                updates = await self._api_get("/updates", params=params)
-                for update in updates or []:
-                    await self._handle_update(update)
-                    update_id = update.get("update_id")
-                    if update_id is not None:
-                        self._last_update_id = update_id
+                data = await self._api_get("/updates", params=params)
+                if not isinstance(data, dict):
+                    logger.warning("maxru: /updates returned non-dict: %r", data)
+                    await asyncio.sleep(1)
+                    continue
+
+                updates = data.get("updates") or []
+                marker = data.get("marker")
+                logger.warning("maxru: /updates received %d updates, marker=%s", len(updates), marker)
+                if marker is not None:
+                    self._last_update_id = marker
+
+                for update in updates:
+                    logger.warning("maxru: raw update: %r", update)
+                    if isinstance(update, dict):
+                        await self._handle_update(update)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -268,37 +310,57 @@ class MaxruAdapter(BasePlatformAdapter):
 
     async def _handle_update(self, update: dict) -> None:
         update_type = update.get("update_type")
-        chat_id = update.get("chat_id")
-        user = update.get("user") or {}
-        user_id = str(user.get("user_id", ""))
-        user_name = user.get("name", "")
+        logger.warning("maxru: _handle_update type=%s update=%r", update_type, update)
+        message = update.get("message", {}) or {}
+        recipient = message.get("recipient", {}) or {}
+        sender = message.get("sender", {}) or {}
 
-        if not self._is_user_allowed(user_id):
-            logger.debug("maxru: user %s not allowed", user_id)
-            return
+        # Events like bot_started have top-level chat_id/user instead of
+        # nested inside message.recipient / message.sender.
+        chat_id = recipient.get("chat_id") or update.get("chat_id")
+        raw_user = sender or update.get("user", {})
+        user_id = str(raw_user.get("user_id", "")) or str(update.get("user_id", ""))
+        user_name = raw_user.get("name", "")
 
-        timestamp_ms = update.get("timestamp")
+        timestamp_ms = message.get("timestamp") or update.get("timestamp")
         timestamp_dt = None
         if isinstance(timestamp_ms, (int, float)) and timestamp_ms > 0:
             timestamp_dt = datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc)
 
         if update_type == "message_created":
-            message = update.get("message", {})
             body = message.get("body", {}) or {}
             text = body.get("text", "")
+            # If user is not yet approved, issue a pairing code via the
+            # unified Hermes PairingStore.
+            if user_id and not self._is_user_allowed(user_id):
+                await self._handle_unauthorized_dm(
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    user_name=user_name,
+                )
+                return
             event = self._build_message_event(
                 chat_id=chat_id,
                 user_id=user_id,
                 user_name=user_name,
                 text=text,
-                message_id=message.get("message_id"),
+                message_id=body.get("mid"),
                 timestamp=timestamp_dt,
             )
             await self.handle_message(event)
+            logger.warning("maxru: dispatched message_created from user=%s text=%r", user_id, text)
 
         elif update_type == "bot_started":
             payload = update.get("payload", "")
             greeting = "Привет!" if not payload else f"Привет! Диплинк: {payload}"
+            # On /start the user isn't approved yet — issue a pairing code.
+            if user_id and not self._is_user_allowed(user_id):
+                await self._handle_unauthorized_dm(
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    user_name=user_name,
+                )
+                return
             await self.send(str(chat_id), greeting)
 
         elif update_type == "message_callback":
@@ -326,7 +388,7 @@ class MaxruAdapter(BasePlatformAdapter):
     ) -> MessageEvent:
         source = SessionSource(
             platform=self.platform,
-            chat_id=str(chat_id),
+            chat_id=str(user_id),
             chat_name=user_name or user_id or str(chat_id),
             chat_type="dm",
             user_id=user_id,
@@ -346,11 +408,94 @@ class MaxruAdapter(BasePlatformAdapter):
     # --------------------------------------------------------------------- #
 
     def _is_user_allowed(self, user_id: str) -> bool:
+        """Check whether ``user_id`` may talk to the bot.
+
+        Authoritative source is the Hermes pairing store (``hermes pairing
+        approve maxru <code>`` writes the user there). The static
+        ``self.allowed_users`` set is kept as a one-shot fallback so that
+        existing users in config.yaml continue to work after the upgrade
+        without a forced re-pairing. It is *not* an alternate grant path —
+        never call ``allowed_users.add()`` from the hot path again.
+        """
         if self.allow_all_users:
-            return True
+            return bool(user_id)
+        if not user_id:
+            return False
         if user_id in self.allowed_users:
             return True
+        try:
+            from gateway.pairing import PairingStore  # type: ignore[import-not-found]
+        except ImportError:
+            # gateway/ not on sys.path inside the plugin's isolated import
+            # context. Fall back to importlib so the security check still
+            # works regardless of how Hermes loaded the plugin.
+            import importlib
+
+            pairing_mod = importlib.import_module("gateway.pairing")
+            PairingStore = pairing_mod.PairingStore
+        try:
+            if PairingStore().is_approved("maxru", user_id):
+                return True
+        except Exception as e:  # pairing store not initialized yet
+            logger.warning("maxru: PairingStore check failed: %s", e)
         return False
+
+    async def _handle_unauthorized_dm(
+        self,
+        *,
+        chat_id: Any,
+        user_id: str,
+        user_name: str,
+    ) -> None:
+        """Issue a Hermes pairing code to a new user.
+
+        Mirrors the flow used by built-in platforms (Telegram, Discord):
+        ``PairingStore.generate_code`` returns an 8-char code or ``None``
+        if the user is rate-limited / platform is locked out / pending is
+        full. The owner approves with
+        ``hermes pairing approve maxru <CODE>`` and from that point on the
+        user is in the approved allowlist.
+        """
+        try:
+            from gateway.pairing import PairingStore  # type: ignore[import-not-found]
+        except ImportError:
+            import importlib
+
+            pairing_mod = importlib.import_module("gateway.pairing")
+            PairingStore = pairing_mod.PairingStore
+
+        store = PairingStore()
+        # Don't spam codes: if the user is already in the pairing rate-limit
+        # window (1 req per 10 min) PairingStore.generate_code returns None.
+        # Mirror the platform's behavior of going silent in that case rather
+        # than issuing a fresh code every message.
+        if store._is_rate_limited("maxru", user_id):
+            logger.warning(
+                "maxru: rate-limited pairing response for user=%s", user_id
+            )
+            return
+
+        code = store.generate_code("maxru", user_id, user_name or "")
+        if not code:
+            # Lockout or pending-full: stay quiet, log only.
+            logger.warning(
+                "maxru: pairing code not issued for user=%s (lockout or pending full)",
+                user_id,
+            )
+            return
+
+        logger.warning(
+            "maxru: issued pairing code for user=%s name=%r (awaiting hermes pairing approve)",
+            user_id,
+            user_name,
+        )
+        await self.send(
+            str(chat_id),
+            "Привет! Это приватный бот. "
+            "Чтобы получить доступ, попроси владельца выполнить на сервере:\n\n"
+            f"`hermes pairing approve maxru {code}`\n\n"
+            "Код действует 1 час. После approve просто напиши сюда ещё раз.",
+        )
 
     # --------------------------------------------------------------------- #
     # Outbound
@@ -364,18 +509,26 @@ class MaxruAdapter(BasePlatformAdapter):
         metadata: Optional[dict] = None,
         **kwargs,
     ) -> SendResult:
-        """Send a plain text message."""
+        """Send a plain text message.
+
+        In MAX API personal dialogs are addressed by ``user_id``,
+        not ``chat_id``. ``BasePlatformAdapter`` calls us with the
+        ``SessionSource.chat_id`` we populated from the inbound sender id,
+        so we pass it through as ``user_id``.
+        """
         if not content:
             return SendResult(success=True, message_id=None)
 
         payload: dict[str, Any] = {
-            "chat_id": chat_id,
             "text": content,
+            "format": "markdown",
         }
         if reply_to:
             payload["reply_to_message_id"] = reply_to
 
-        return await self._send_message_payload(payload)
+        params = self._user_params(chat_id)
+        logger.warning("maxru: send payload: chat_id=%s params=%r body=%r", chat_id, params, payload)
+        return await self._send_message_payload(payload, params=params)
 
     async def send_image(
         self,
@@ -385,11 +538,11 @@ class MaxruAdapter(BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         """Send an image by URL (no upload needed for images)."""
-        payload: dict[str, Any] = {"chat_id": chat_id}
+        payload: dict[str, Any] = {"format": "markdown"}
         if caption:
             payload["text"] = caption
         payload["attachments"] = [{"type": "image", "payload": {"url": image_url}}]
-        return await self._send_message_payload(payload)
+        return await self._send_message_payload(payload, params=self._user_params(chat_id))
 
     async def send_image_file(
         self,
@@ -400,11 +553,11 @@ class MaxruAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Upload a local image and send it."""
         token = await self._upload_file(path)
-        payload: dict[str, Any] = {"chat_id": chat_id}
+        payload: dict[str, Any] = {"format": "markdown"}
         if caption:
             payload["text"] = caption
         payload["attachments"] = [{"type": "image", "payload": {"token": token}}]
-        return await self._send_message_payload(payload)
+        return await self._send_message_payload(payload, params=self._user_params(chat_id))
 
     async def send_document(
         self,
@@ -416,12 +569,16 @@ class MaxruAdapter(BasePlatformAdapter):
         """Upload a local file and send it."""
         token = await self._upload_file(path)
         payload: dict[str, Any] = {
-            "chat_id": chat_id,
+            "format": "markdown",
             "attachments": [{"type": "file", "payload": {"token": token}}],
         }
         if caption:
             payload["text"] = caption
-        return await self._send_message_payload(payload)
+        return await self._send_message_payload(payload, params=self._user_params(chat_id))
+
+    def _user_params(self, chat_id: str) -> dict[str, Any]:
+        """Return MAX API query params for a personal-dialog recipient."""
+        return {"user_id": int(chat_id) if chat_id.isdigit() else chat_id}
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """MAX API does not expose a typing indicator; noop."""
@@ -456,6 +613,7 @@ class MaxruAdapter(BasePlatformAdapter):
         payload = {
             "chat_id": chat_id,
             "text": question,
+            "format": "markdown",
             "attachments": [
                 {
                     "type": "inline_keyboard",
@@ -463,7 +621,7 @@ class MaxruAdapter(BasePlatformAdapter):
                 }
             ],
         }
-        return await self._send_message_payload(payload)
+        return await self._send_message_payload(payload, params=self._user_params(chat_id))
 
     # --------------------------------------------------------------------- #
     # API helpers
@@ -476,11 +634,11 @@ class MaxruAdapter(BasePlatformAdapter):
         async with self._session.get(self.api_url + path, params=params) as resp:
             return await self._parse_response(resp)
 
-    async def _api_post(self, path: str, json_data: dict) -> Any:
+    async def _api_post(self, path: str, json_data: dict, params: Optional[dict] = None) -> Any:
         await self._acquire_rate_token()
         if not self._session:
             raise MaxruAPIError("session not initialized")
-        async with self._session.post(self.api_url + path, json=json_data) as resp:
+        async with self._session.post(self.api_url + path, params=params, json=json_data) as resp:
             return await self._parse_response(resp)
 
     async def _parse_response(self, resp: Any) -> Any:
@@ -521,9 +679,9 @@ class MaxruAdapter(BasePlatformAdapter):
             raise MaxruAPIError(f"upload did not return token: {result}")
         return token
 
-    async def _send_message_payload(self, payload: dict) -> SendResult:
+    async def _send_message_payload(self, payload: dict, params: Optional[dict] = None) -> SendResult:
         try:
-            result = await self._api_post("/messages", payload)
+            result = await self._api_post("/messages", payload, params=params)
             message_id = result.get("message_id") if isinstance(result, dict) else None
             return SendResult(success=True, message_id=str(message_id) if message_id else None)
         except Exception as e:
@@ -552,11 +710,13 @@ async def _standalone_send(
     if not token:
         return {"success": False, "error": "MAXRU_TOKEN not configured"}
 
-    payload = {"chat_id": chat_id, "text": message}
+    payload = {"text": message, "format": "markdown"}
+    params = {"user_id": int(chat_id) if str(chat_id).isdigit() else chat_id}
     timeout = aiohttp.ClientTimeout(total=60)
-    async with aiohttp.ClientSession(headers={"Authorization": token}, timeout=timeout) as session:
+    connector = aiohttp.TCPConnector(verify_ssl=False)
+    async with aiohttp.ClientSession(headers={"Authorization": token}, timeout=timeout, connector=connector) as session:
         try:
-            async with session.post(api_url + "/messages", json=payload) as resp:
+            async with session.post(api_url + "/messages", params=params, json=payload) as resp:
                 if resp.status >= 400:
                     body = await resp.text()
                     return {"success": False, "error": f"HTTP {resp.status}: {body[:200]}"}

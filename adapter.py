@@ -489,8 +489,9 @@ class MaxruAdapter(BasePlatformAdapter):
             user_id,
             user_name,
         )
+        # MAX API personal dialogs are addressed by user_id, not chat_id.
         await self.send(
-            str(chat_id),
+            str(user_id),
             "Привет! Это приватный бот. "
             "Чтобы получить доступ, попроси владельца выполнить на сервере:\n\n"
             f"`hermes pairing approve maxru {code}`\n\n"
@@ -547,33 +548,85 @@ class MaxruAdapter(BasePlatformAdapter):
     async def send_image_file(
         self,
         chat_id: str,
-        path: str,
+        file_path: Optional[str] = None,
+        path: Optional[str] = None,
+        image_path: Optional[str] = None,
         caption: str = "",
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[dict] = None,
         **kwargs,
     ) -> SendResult:
-        """Upload a local image and send it."""
-        token = await self._upload_file(path)
+        """Upload a local image and send it as an attachment.
+
+        Accepts three parameter names for backwards compatibility:
+          - ``image_path`` — what ``BasePlatformAdapter.send_multiple_images``
+            in :mod:`gateway.platforms.base` actually passes when the user
+            message contains ``file://...`` URLs.
+          - ``file_path`` — preferred, matches the ``send_document`` signature.
+          - ``path`` — legacy positional name.
+
+        Any one of the three may be used; the first non-None wins.
+        """
+        actual_path = image_path or file_path or path
+        if not actual_path:
+            return SendResult(
+                success=False,
+                error=(
+                    "send_image_file called without image_path, file_path "
+                    "or path"
+                ),
+            )
+        token = await self._upload_file(actual_path, upload_type="image")
         payload: dict[str, Any] = {"format": "markdown"}
         if caption:
             payload["text"] = caption
+        if reply_to:
+            payload["reply_to_message_id"] = reply_to
         payload["attachments"] = [{"type": "image", "payload": {"token": token}}]
-        return await self._send_message_payload(payload, params=self._user_params(chat_id))
+        params = self._user_params(chat_id)
+        if file_name:
+            params = {**params, "file_name": file_name}
+        return await self._send_message_payload(payload, params=params)
 
     async def send_document(
         self,
         chat_id: str,
-        path: str,
+        file_path: Optional[str] = None,
+        path: Optional[str] = None,
         caption: str = "",
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[dict] = None,
         **kwargs,
     ) -> SendResult:
-        """Upload a local file and send it."""
-        token = await self._upload_file(path)
+        """Upload a local file and send it as a native MAX attachment.
+
+        The base class dispatches file deliveries with the keyword
+        ``file_path``; accept it as the canonical name while still
+        honouring the legacy ``path`` argument for callers that have not
+        been updated. ``**kwargs`` swallows ``metadata`` / ``reply_to`` so
+        the signature stays source-compatible with the base class.
+        """
+        upload_path = file_path if file_path is not None else path
+        if not upload_path:
+            return SendResult(
+                success=False,
+                error="send_document called without file_path or path",
+            )
+        try:
+            token = await self._upload_file(upload_path)
+        except Exception as e:
+            logger.warning("maxru: upload failed for %s: %s", upload_path, e)
+            return SendResult(success=False, error=str(e))
         payload: dict[str, Any] = {
             "format": "markdown",
             "attachments": [{"type": "file", "payload": {"token": token}}],
         }
         if caption:
             payload["text"] = caption
+        if reply_to:
+            payload["reply_to_message_id"] = reply_to
         return await self._send_message_payload(payload, params=self._user_params(chat_id))
 
     def _user_params(self, chat_id: str) -> dict[str, Any]:
@@ -663,27 +716,231 @@ class MaxruAdapter(BasePlatformAdapter):
             self._rate_tokens = 0
         self._rate_tokens -= 1
 
-    async def _upload_file(self, path: str) -> str:
+    async def _upload_file(self, path: str, upload_type: str = "file") -> str:
+        """Upload a local file to MAX and return a token usable as
+        ``attachments[].payload.token`` in a subsequent ``/messages`` call.
+
+        The official MAX Bot API docs
+        (https://dev.max.ru/docs-api/methods/POST/uploads) describe a
+        2-step flow for ``type=file`` (and ``type=image``):
+
+          1. ``POST /uploads?type=file`` (or ``type=image``) with the
+             bot's ``Authorization`` header → response:
+             ``{"url": "https://fu.oneme.ru/..."}`` for file or
+             ``{"url": "https://iu.oneme.ru/..."}`` for image
+             (host differs by type; video/audio → ``vu.okcdn.ru``).
+             For video/audio the response ALSO includes a ``token``;
+             for file/image the token is returned only after the
+             actual upload.
+
+          2. ``POST {url}`` with ``Content-Type: multipart/form-data``
+             and the file in a multipart field literally named ``data``
+             (NOT ``file`` — that is the common source of the
+             ``Invalid token`` error). The response on success is
+             ``{"token": "..."}`` for file/image. For video/audio the
+             server returns ``{"retval": "..."}`` and the token from
+             step 1 is reused.
+
+          3. Use the token in ``attachments[].payload.token`` when
+             calling ``POST /messages``. The server may briefly return
+             ``attachment.not.ready`` while it processes the file —
+             callers should retry with backoff.
+
+        IMPORTANT — tokens are type-specific. A token obtained from
+        ``?type=file`` upload can ONLY be used as
+        ``attachments[].payload.token`` for an attachment of
+        ``type=file``. For ``type=image`` attachments you MUST
+        request a fresh token from ``?type=image``. Using a
+        file-token as a photo-token gives
+        ``HTTP 400 {"code":"proto.payload","message":"Invalid photo
+        token provided: ..."}`` from the messages endpoint.
+
+        Without ``?type=<kind>`` query parameter the API returns
+        ``HTTP 400: Missing required parameter: type``.
+        """
+        if upload_type not in ("file", "image"):
+            raise MaxruAPIError(
+                f"unsupported upload_type: {upload_type!r} (must be 'file' or 'image')"
+            )
         aiohttp = _import_aiohttp()
         if not self._session:
             raise MaxruAPIError("session not initialized")
         await self._acquire_rate_token()
         file_path = Path(path)
+        if not file_path.exists():
+            raise MaxruAPIError(f"file does not exist: {file_path}")
+
+        # Step 1: ask MAX for a signed upload URL. The response is
+        # ``{"url": "https://fu.oneme.ru/upload.do?..."}`` for type=file.
+        # We deliberately do NOT pull a ``token`` from this response
+        # for type=file — for file/image the token is only returned
+        # after step 2.
+        upload_meta_url = self.api_url + f"/uploads?type={upload_type}"
         with file_path.open("rb") as f:
             data = aiohttp.FormData()
             data.add_field("file", f, filename=file_path.name)
-            async with self._session.post(self.api_url + "/uploads", data=data) as resp:
-                result = await self._parse_response(resp)
-        token = result.get("token") if isinstance(result, dict) else None
+            async with self._session.post(
+                upload_meta_url, data=data
+            ) as resp:
+                upload_meta = await self._parse_response(resp)
+        signed_url = (
+            upload_meta.get("url") if isinstance(upload_meta, dict) else None
+        )
+        if not signed_url:
+            raise MaxruAPIError(
+                f"upload did not return a signed URL: {upload_meta}"
+            )
+
+        # Step 2: actually upload the file body to the signed URL. The
+        # critical detail (per docs) is the multipart field name: it
+        # MUST be ``data``. Using ``file`` is the documented failure
+        # mode that produces ``Invalid token`` downstream.
+        # ``fu.oneme.ru`` does NOT require our auth token (it's a
+        # signed-URL upload), so we drop the Authorization header here.
+        import mimetypes
+        mime_type, _ = mimetypes.guess_type(file_path.name)
+        if not mime_type:
+            mime_type = "application/octet-stream"
+        file_bytes = file_path.read_bytes()
+        upload_form = aiohttp.FormData()
+        upload_form.add_field(
+            "data",
+            file_bytes,
+            filename=file_path.name,
+            content_type=mime_type,
+        )
+        async with self._session.post(
+            signed_url, data=upload_form
+        ) as resp:
+            upload_status = resp.status
+            try:
+                upload_result = await resp.json()
+            except Exception:
+                upload_result = {"raw": await resp.text()}
+        if upload_status >= 400:
+            raise MaxruAPIError(
+                f"file upload to signed URL failed: HTTP {upload_status}: "
+                f"{str(upload_result)[:300]}"
+            )
+
+        # Step 3: pull the actual attachment token from step 2's
+        # response. The exact shape depends on the upload type:
+        #   * ``type=file``  →  ``{"token": "..."}`` at the top level
+        #   * ``type=image`` →  ``{"photos": {"<hash>": {"token": "..."}}}``
+        #     — the API returns a dict keyed by photo hash, and we want
+        #     the ``token`` of the (only) entry.
+        if not isinstance(upload_result, dict):
+            raise MaxruAPIError(
+                f"upload response is not a JSON object: {upload_result!r}"
+            )
+        token = upload_result.get("token")
+        if not token and upload_type == "image":
+            photos = upload_result.get("photos")
+            if isinstance(photos, dict) and photos:
+                # Take the first photo's token; there is only one for
+                # a single-file upload.
+                first_entry = next(iter(photos.values()))
+                if isinstance(first_entry, dict):
+                    token = first_entry.get("token")
         if not token:
-            raise MaxruAPIError(f"upload did not return token: {result}")
+            raise MaxruAPIError(
+                f"upload did not return a token: {upload_result!r}"
+            )
         return token
 
-    async def _send_message_payload(self, payload: dict, params: Optional[dict] = None) -> SendResult:
+    async def _send_message_payload_with_retry(
+        self, payload: dict, params: Optional[dict] = None
+    ) -> SendResult:
+        """Same as ``_send_message_payload`` but retries on
+        ``attachment.not.ready`` with exponential backoff.
+
+        Per the MAX Bot API docs
+        (https://dev.max.ru/docs-api/methods/POST/uploads#Обработка-медиафайлов):
+        "После успешной загрузки сервер обрабатывает файл. Файлы от
+        нескольких мегабайт обрабатываются дольше. Если отправить
+        сообщение с вложением сразу после загрузки, может возникнуть
+        ошибка ``attachment.not.ready``. После загрузки файла сделайте
+        паузу перед отправкой сообщения. Если отправка не удалась,
+        повторите попытку через некоторое время."
+
+        We do an initial 1-second wait, then retry up to 4 more times
+        (1s → 2s → 4s → 8s) when the server returns
+        ``attachment.not.ready``. Total wait budget: ~15s.
+        """
+        # Initial cool-down — the server needs a moment to start
+        # processing the freshly-uploaded attachment.
+        await asyncio.sleep(1.0)
+        delays = [0.0, 2.0, 4.0, 8.0]
+        last_error: Optional[str] = None
+        for attempt, delay in enumerate(delays):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                result = await self._api_post(
+                    "/messages", payload, params=params
+                )
+                message_id = (
+                    result.get("message_id")
+                    if isinstance(result, dict)
+                    else None
+                )
+                return SendResult(
+                    success=True,
+                    message_id=str(message_id) if message_id else None,
+                )
+            except MaxruAPIError as e:
+                err_str = str(e)
+                last_error = err_str
+                if "attachment.not.ready" in err_str and attempt < len(delays) - 1:
+                    logger.warning(
+                        "maxru: attachment not ready (attempt %d/%d), "
+                        "backing off %.1fs",
+                        attempt + 1,
+                        len(delays),
+                        delays[attempt + 1],
+                    )
+                    continue
+                # Not a retryable error, or out of retries.
+                logger.exception("maxru: send failed: %s", e)
+                return SendResult(success=False, error=err_str)
+            except Exception as e:
+                logger.exception("maxru: send failed: %s", e)
+                return SendResult(success=False, error=str(e))
+        return SendResult(
+            success=False,
+            error=(
+                f"attachment never became ready after {len(delays)} "
+                f"attempts: {last_error}"
+            ),
+        )
+
+    async def _send_message_payload(
+        self, payload: dict, params: Optional[dict] = None
+    ) -> SendResult:
+        """Send a message to MAX via ``POST /messages``.
+
+        If the payload contains an ``attachments`` field, this delegates
+        to ``_send_message_payload_with_retry`` which handles the
+        ``attachment.not.ready`` race condition documented at
+        https://dev.max.ru/docs-api/methods/POST/uploads.
+        """
+        # If the payload carries attachments, use the retry path
+        # — the server can return ``attachment.not.ready`` for a few
+        # seconds after upload and we want to be resilient to that.
+        if isinstance(payload, dict) and payload.get("attachments"):
+            return await self._send_message_payload_with_retry(
+                payload, params=params
+            )
+        # Plain text-only path: no race condition possible.
         try:
             result = await self._api_post("/messages", payload, params=params)
-            message_id = result.get("message_id") if isinstance(result, dict) else None
-            return SendResult(success=True, message_id=str(message_id) if message_id else None)
+            message_id = (
+                result.get("message_id") if isinstance(result, dict) else None
+            )
+            return SendResult(
+                success=True,
+                message_id=str(message_id) if message_id else None,
+            )
         except Exception as e:
             logger.exception("maxru: send failed: %s", e)
             return SendResult(success=False, error=str(e))

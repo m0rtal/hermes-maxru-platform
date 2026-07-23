@@ -181,6 +181,9 @@ class MaxruAdapter(BasePlatformAdapter):
         self._poll_task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
         self._last_update_id: Optional[int] = None
+        # Cache the personal dialog chat_id from the first full update so
+        # thin voice-note envelopes can be resolved via GET /messages.
+        self._last_known_chat_id: Optional[int] = None
         # Token bucket rate limiter (target below MAX's 30 rps)
         self._rate_tokens = self.rps_limit
         self._rate_last = time.monotonic()
@@ -322,6 +325,10 @@ class MaxruAdapter(BasePlatformAdapter):
         user_id = str(raw_user.get("user_id", "")) or str(update.get("user_id", ""))
         user_name = raw_user.get("name", "")
 
+        # Remember the DM chat_id so thin voice envelopes can be resolved later.
+        if chat_id and isinstance(chat_id, int):
+            self._last_known_chat_id = chat_id
+
         timestamp_ms = message.get("timestamp") or update.get("timestamp")
         timestamp_dt = None
         if isinstance(timestamp_ms, (int, float)) and timestamp_ms > 0:
@@ -332,6 +339,79 @@ class MaxruAdapter(BasePlatformAdapter):
             text = body.get("text", "")
             raw_attachments = body.get("attachments") or []
             # Skip phantom updates that carry no sender (e.g. voice notes received
+            # ``message`` is occasionally absent for voice notes delivered
+            # via long polling — MAX hands us a thin update envelope
+            # (``{update_type, timestamp, user_locale}``) so that the
+            # polling loop doesn't have to wait for the audio body to
+            # upload. We treat that as a "phantom" message_created and
+            # back off briefly before asking ``GET /messages`` for the
+            # freshest message in our own dialog. The follow-up
+            # ``GET /messages?chat_id=<us>`` returns the full body with
+            # ``body.attachments[].type == "audio"`` and the same
+            # ``mid`` we need to download it.
+            if not message and update_type == "message_created":
+                logger.warning(
+                    "maxru: thin message_created (likely voice over long "
+                    "polling) — backing off 1.0s and re-polling "
+                    "/messages for the new audio"
+                )
+                await asyncio.sleep(1.0)
+                if not self._session:
+                    return
+                lookup_chat_id = self._last_known_chat_id
+                if not lookup_chat_id:
+                    logger.warning(
+                        "maxru: cannot resolve thin voice update: "
+                        "no known chat_id yet (wait for a text message first)"
+                    )
+                    return
+                try:
+                    async with self._session.get(
+                        "/messages",
+                        params={"chat_id": lookup_chat_id, "count": 1},
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            msgs = data.get("messages") or []
+                            if msgs:
+                                top = msgs[0]
+                                mbody = top.get("body", {}) or {}
+                                mmid = mbody.get("mid")
+                                mts = top.get("timestamp")
+                                # Build a synthetic update so the rest of
+                                # the pipeline can stay unchanged.
+                                mrecipient = top.get(
+                                    "recipient", {}
+                                ) or {}
+                                msender = top.get("sender", {}) or {}
+                                synthetic = {
+                                    "update_type": "message_created",
+                                    "timestamp": mts or update.get(
+                                        "timestamp"
+                                    ),
+                                    "user_locale": update.get(
+                                        "user_locale", "ru"
+                                    ),
+                                    "message": {
+                                        "recipient": mrecipient,
+                                        "sender": msender,
+                                        "timestamp": mts,
+                                        "body": mbody,
+                                    },
+                                }
+                                # Recurse once with the synthetic update.
+                                # NOTE: the recursion is bounded — we only
+                                # take this path on the first call where
+                                # ``message`` was empty, and the recursive
+                                # call has ``message`` populated.
+                                await self._handle_update(synthetic)
+                                return
+                except Exception as e:
+                    logger.warning(
+                        "maxru: voice-note re-poll failed: %s", e
+                    )
+                return
             # via long polling only expose an empty envelope). Without a user_id
             # we cannot authorize, route, or reply.
             if not user_id:

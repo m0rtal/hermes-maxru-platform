@@ -347,7 +347,9 @@ class MaxruAdapter(BasePlatformAdapter):
                 message_id=body.get("mid"),
                 timestamp=timestamp_dt,
             )
+            await self.send_typing(str(chat_id))
             await self.handle_message(event)
+            await self.mark_as_read(str(chat_id), body.get("mid"))
             logger.warning("maxru: dispatched message_created from user=%s text=%r", user_id, text)
 
         elif update_type == "bot_started":
@@ -634,8 +636,40 @@ class MaxruAdapter(BasePlatformAdapter):
         return {"user_id": int(chat_id) if chat_id.isdigit() else chat_id}
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        """MAX API does not expose a typing indicator; noop."""
-        return
+        """Show the "bot is typing" indicator in the MAX dialog.
+
+        MAX supports `POST /chats/{chat_id}/actions` with `{"action":
+        "typing_on"}`.  `typing_off` is not supported by the API and the
+        indicator disappears automatically after a short timeout, so we
+        only turn it on before starting to compose a reply.
+        """
+        if not chat_id:
+            return
+        try:
+            await self._api_post(
+                f"/chats/{chat_id}/actions",
+                {"action": "typing_on"},
+            )
+        except MaxruAPIError as e:
+            logger.debug("maxru: send_typing failed for chat_id=%s: %s", chat_id, e)
+
+    async def mark_as_read(
+        self, chat_id: str, message_id: Optional[str] = None
+    ) -> None:
+        """Attempt to mark a message as read.
+
+        MAX does not document a read-receipt endpoint for personal dialogs.
+        `POST /chats/{chat_id}/actions` only accepts `typing_on`.  We keep
+        this hook so a future API addition can be wired in without changing
+        the call sites.
+        """
+        if not chat_id:
+            return
+        logger.debug(
+            "maxru: mark_as_read not implemented by MAX API (chat_id=%s message_id=%s)",
+            chat_id,
+            message_id,
+        )
 
     async def get_chat_info(self, chat_id: str) -> dict:
         """Return basic chat info."""

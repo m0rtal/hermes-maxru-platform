@@ -331,6 +331,16 @@ class MaxruAdapter(BasePlatformAdapter):
             body = message.get("body", {}) or {}
             text = body.get("text", "")
             raw_attachments = body.get("attachments") or []
+            # Skip phantom updates that carry no sender (e.g. voice notes received
+            # via long polling only expose an empty envelope). Without a user_id
+            # we cannot authorize, route, or reply.
+            if not user_id:
+                logger.warning(
+                    "maxru: ignoring message_created without sender "
+                    "(likely voice note over long polling): update=%r",
+                    update,
+                )
+                return
             # If user is not yet approved, issue a pairing code via the
             # unified Hermes PairingStore.
             if user_id and not self._is_user_allowed(user_id):

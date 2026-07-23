@@ -330,6 +330,7 @@ class MaxruAdapter(BasePlatformAdapter):
         if update_type == "message_created":
             body = message.get("body", {}) or {}
             text = body.get("text", "")
+            raw_attachments = body.get("attachments") or []
             # If user is not yet approved, issue a pairing code via the
             # unified Hermes PairingStore.
             if user_id and not self._is_user_allowed(user_id):
@@ -339,6 +340,26 @@ class MaxruAdapter(BasePlatformAdapter):
                     user_name=user_name,
                 )
                 return
+            # For every attachment, try to download a local copy so that
+            # the core can use it (vision for images, STT for audio,
+            # etc.). The original raw structure is preserved in
+            # ``event.metadata["maxru_attachments"]`` regardless.
+            media_urls: list[str] = []
+            media_types: list[str] = []
+            attachment_meta: list[dict] = []
+            for att in raw_attachments:
+                att_type = att.get("type")
+                att_payload = att.get("payload") or {}
+                attachment_meta.append(
+                    {"type": att_type, "payload": att_payload}
+                )
+                downloaded = await self._download_attachment(
+                    att_type, att_payload, body.get("mid")
+                )
+                if downloaded:
+                    path, mime = downloaded
+                    media_urls.append(path)
+                    media_types.append(mime)
             event = self._build_message_event(
                 chat_id=chat_id,
                 user_id=user_id,
@@ -346,11 +367,21 @@ class MaxruAdapter(BasePlatformAdapter):
                 text=text,
                 message_id=body.get("mid"),
                 timestamp=timestamp_dt,
+                media_urls=media_urls,
+                media_types=media_types,
+                metadata={"maxru_attachments": attachment_meta},
             )
             await self.send_typing(str(chat_id))
             await self.handle_message(event)
             await self.mark_as_read(str(chat_id), body.get("mid"))
-            logger.warning("maxru: dispatched message_created from user=%s text=%r", user_id, text)
+            logger.warning(
+                "maxru: dispatched message_created from user=%s text=%r "
+                "attachments=%d downloaded=%d",
+                user_id,
+                text,
+                len(attachment_meta),
+                len(media_urls),
+            )
 
         elif update_type == "bot_started":
             payload = update.get("payload", "")
@@ -387,6 +418,9 @@ class MaxruAdapter(BasePlatformAdapter):
         text: str,
         message_id: Optional[Any],
         timestamp: Optional[datetime],
+        media_urls: Optional[list[str]] = None,
+        media_types: Optional[list[str]] = None,
+        metadata: Optional[dict] = None,
     ) -> MessageEvent:
         source = SessionSource(
             platform=self.platform,
@@ -403,6 +437,9 @@ class MaxruAdapter(BasePlatformAdapter):
             text=text,
             message_id=str(message_id) if message_id is not None else None,
             timestamp=timestamp or datetime.now(timezone.utc),
+            media_urls=list(media_urls or []),
+            media_types=list(media_types or []),
+            metadata=dict(metadata or {}),
         )
 
     # --------------------------------------------------------------------- #
@@ -980,9 +1017,136 @@ class MaxruAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(e))
 
 
-# ----------------------------------------------------------------------------- #
+    # --------------------------------------------------------------------- #
+    # Inbound attachment download helpers
+    # --------------------------------------------------------------------- #
+
+    async def _download_one(
+            self,
+        url: str,
+        dest: Path,
+    ) -> Optional[tuple[Path, str]]:
+        """Stream ``url`` into ``dest`` and return ``(path, content_type)``.
+
+        Returns ``None`` on HTTP error or if MAX returns a non-2xx response.
+        Caller decides the cache key; this helper does not deduplicate.
+        """
+        try:
+            async with self._session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                if resp.status >= 400:
+                    logger.warning(
+                        "maxru: attachment download failed HTTP %s for %s",
+                        resp.status,
+                        url,
+                    )
+                    return None
+                content_type = resp.headers.get("Content-Type", "").split(";")[0].strip()
+                with dest.open("wb") as f:
+                    async for chunk in resp.content.iter_chunked(64 * 1024):
+                        if chunk:
+                            f.write(chunk)
+                return dest, content_type
+        except Exception as e:
+            logger.warning("maxru: attachment download error for %s: %s", url, e)
+            return None
+
+
+# -----------------------------------------------------------------------------
 # Standalone sender (for cron / send_message_tool outside the gateway process)
-# ----------------------------------------------------------------------------- #
+# -----------------------------------------------------------------------------
+
+    async def _download_attachment(
+        self,
+        att_type: Optional[str],
+        att_payload: dict,
+        message_id: Optional[str],
+    ) -> Optional[tuple[str, str]]:
+        """Best-effort download of a single inbound attachment.
+
+        Returns ``(local_path, mime_type)`` if the file was successfully fetched,
+        or ``None`` if MAX didn't expose a download URL for this attachment type.
+
+        Strategy:
+          1. If ``payload.url`` is present, download it directly (this is what
+             image attachments expose — a CDN URL on ``i.oneme.ru``).
+          2. Otherwise, for ``audio``/``file``/``video``/``image``, do a
+             ``GET /messages?message_ids=<mid>`` to fetch the full Message
+             object. Sometimes the extended payload returned by that endpoint
+             includes a ``url`` field the Update payload didn't expose.
+          3. If neither yields a URL, log and return ``None`` so the caller can
+             fall back to text-only handling and surface a hint to the user.
+        """
+        if not att_type or not att_payload:
+            return None
+        default_mime, default_ext = _MAXRU_TYPE_DEFAULTS.get(
+            att_type, ("application/octet-stream", ".bin")
+        )
+        if not self._session:
+            return None
+
+        # Step 1: use payload.url if present.
+        direct_url = att_payload.get("url")
+        if direct_url:
+            cache_name = f"{att_type}-{int(time.time() * 1000)}{default_ext}"
+            dest = _MAXRU_ATT_DIR / cache_name
+            result = await self._download_one(direct_url, dest)
+            if result is not None:
+                path, mime = result
+                return str(path), mime or default_mime
+            # If direct download failed, fall through to step 2.
+
+        # Step 2: try GET /messages?message_ids=<mid> for an extended payload.
+        if message_id:
+            try:
+                async with self._session.get(
+                    "/messages",
+                    params={"message_ids": message_id},
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        messages = data.get("messages") or []
+                        if messages:
+                            mbody = (
+                                messages[0].get("body", {}) or {}
+                            )
+                            for ext_att in mbody.get("attachments") or []:
+                                if (ext_att.get("type") or "").lower() == (
+                                    att_type or ""
+                                ).lower():
+                                    ext_payload = ext_att.get("payload") or {}
+                                    ext_url = ext_payload.get("url")
+                                    if ext_url:
+                                        cache_name = (
+                                            f"{att_type}-"
+                                            f"{int(time.time() * 1000)}"
+                                            f"{default_ext}"
+                                        )
+                                        dest = _MAXRU_ATT_DIR / cache_name
+                                        res2 = await self._download_one(ext_url, dest)
+                                        if res2 is not None:
+                                            path, mime = res2
+                                            return str(path), mime or default_mime
+                                    break
+            except Exception as e:
+                logger.warning(
+                    "maxru: /messages lookup for attachment of type=%s failed: %s",
+                    att_type,
+                    e,
+                )
+
+        # Step 3: no URL resolvable. Tell the operator what we know so the
+        # next iteration of the patch can target the right endpoint.
+        token_short = (att_payload.get("token") or "")[:16]
+        logger.warning(
+            "maxru: attachment of type=%s has no downloadable URL "
+            "(token=%s…, mid=%s). Tell Hermes what the user sent so the "
+            "plugin can be extended.",
+            att_type,
+            token_short,
+            message_id,
+        )
+        return None
 
 async def _standalone_send(
     pconfig,
@@ -1014,3 +1178,9 @@ async def _standalone_send(
                 return {"success": True, "status": resp.status}
         except Exception as e:
             return {"success": False, "error": str(e)}
+
+
+    # Attach this method to MaxruAdapter. We define it as a free function and
+    # inject it below so the patch can be applied without re-indenting hundreds
+    # of lines of the existing class. The class will gain a method of the same
+    # name that delegates to this implementation.

@@ -1130,6 +1130,10 @@ class MaxruAdapter(BasePlatformAdapter):
         if not chat_id:
             return
         try:
+            logger.warning(
+                "maxru: send_typing chat_id=%s",
+                chat_id,
+            )
             await self._api_post(
                 f"/chats/{chat_id}/actions",
                 {"action": "typing_on"},
@@ -1149,8 +1153,9 @@ class MaxruAdapter(BasePlatformAdapter):
         """
         if not chat_id:
             return
-        logger.debug(
-            "maxru: mark_as_read not implemented by MAX API (chat_id=%s message_id=%s)",
+        logger.warning(
+            "maxru: mark_as_read skipped (MAX API has no read-receipt "
+            "endpoint for personal dialogs) chat_id=%s message_id=%s",
             chat_id,
             message_id,
         )

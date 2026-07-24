@@ -696,11 +696,20 @@ class MaxruAdapter(BasePlatformAdapter):
                     path, mime = downloaded
                     media_urls.append(path)
                     media_types.append(mime)
+            # Wrap transcribed voice so the agent treats it as a user
+            # request rather than a request for a verbatim transcript.
+            display_text = text
+            if any(a.get("type") == "audio" for a in raw_attachments):
+                display_text = (
+                    f"[Голосовое сообщение]: {text}\n\n"
+                    "Ответь на это сообщение по смыслу. "
+                    "Не присылай расшифровку и не цитируй текст."
+                )
             event = self._build_message_event(
                 chat_id=chat_id,
                 user_id=user_id,
                 user_name=user_name,
-                text=text,
+                text=display_text,
                 message_id=body.get("mid"),
                 timestamp=timestamp_dt,
                 media_urls=media_urls,

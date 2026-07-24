@@ -60,6 +60,20 @@ from gateway.platforms.base import (
 from gateway.session import SessionSource
 from gateway.config import Platform, PlatformConfig
 
+# Cache directory for inbound attachments (images, audio, files, etc.)
+_MAXRU_ATT_DIR = (
+    Path(os.environ.get("HERMES_HOME", "/root/.hermes")) / "cache" / "maxru_attachments"
+)
+
+# Default MIME type / file extension for known MAX attachment types.
+_MAXRU_TYPE_DEFAULTS = {
+    "image": ("image/jpeg", ".jpg"),
+    "audio": ("audio/ogg", ".ogg"),
+    "voice": ("audio/ogg", ".ogg"),
+    "video": ("video/mp4", ".mp4"),
+    "file": ("application/octet-stream", ".bin"),
+}
+
 
 def register(ctx) -> None:
     """Plugin entry point called by Hermes."""
@@ -174,6 +188,10 @@ class MaxruAdapter(BasePlatformAdapter):
         self.home_channel: Optional[str] = extra.get("home_channel")
         self.long_polling: bool = bool(extra.get("long_polling", True))
         self.webhook_url: Optional[str] = extra.get("webhook_url")
+        self.webhook_listen_host: str = extra.get("webhook_listen_host", "0.0.0.0")
+        self.webhook_listen_port: int = int(extra.get("webhook_listen_port", 8080))
+        self.stt_model_name: str = extra.get("stt_model", "base")
+        self.stt_language: str = extra.get("stt_language", "ru")
         self.update_timeout: int = int(extra.get("update_timeout", 30))
         self.rps_limit: float = float(extra.get("rps_limit", 25))
 
@@ -181,9 +199,15 @@ class MaxruAdapter(BasePlatformAdapter):
         self._poll_task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
         self._last_update_id: Optional[int] = None
-        # Cache the personal dialog chat_id from the first full update so
-        # thin voice-note envelopes can be resolved via GET /messages.
         self._last_known_chat_id: Optional[int] = None
+        # Deduplicate messages delivered both via webhook and long polling.
+        self._seen_mids: set[str] = set()
+        # Webhook server state
+        self._webhook_app: Optional[Any] = None
+        self._webhook_runner: Optional[Any] = None
+        self._webhook_site: Optional[Any] = None
+        # Lazy-loaded STT model
+        self._stt_model: Optional[Any] = None
         # Token bucket rate limiter (target below MAX's 30 rps)
         self._rate_tokens = self.rps_limit
         self._rate_last = time.monotonic()
@@ -238,10 +262,25 @@ class MaxruAdapter(BasePlatformAdapter):
         if self.long_polling:
             self._stop_event.clear()
             self._poll_task = asyncio.create_task(self._poll_loop())
-        elif self.webhook_url:
+        # Always start the webhook listener if a bind port/host is configured.
+        # The actual public URL is provided via config (pinggy/ngrok/...).
+        await self._start_webhook_server()
+        if self.webhook_url:
             await self._register_webhook()
+        else:
+            logger.warning(
+                "maxru: webhook_url not configured; voice messages will not be "
+                "processed. Set maxru.webhook_url to a public HTTPS endpoint "
+                "that forwards to %s:%d.",
+                self.webhook_listen_host,
+                self.webhook_listen_port,
+            )
 
-        logger.warning("maxru: connect() finished successfully; long_polling=%s", self.long_polling)
+        logger.warning(
+            "maxru: connect() finished successfully; long_polling=%s webhook_url=%s",
+            self.long_polling,
+            self.webhook_url,
+        )
         return True
 
     async def disconnect(self) -> None:
@@ -252,6 +291,7 @@ class MaxruAdapter(BasePlatformAdapter):
                 await self._poll_task
             except asyncio.CancelledError:
                 pass
+        await self._stop_webhook_server()
         if self._session:
             await self._session.close()
             self._session = None
@@ -293,6 +333,195 @@ class MaxruAdapter(BasePlatformAdapter):
     # --------------------------------------------------------------------- #
     # Inbound: Webhook
     # --------------------------------------------------------------------- #
+
+    async def _start_webhook_server(self) -> None:
+        aiohttp = _import_aiohttp()
+        if self._webhook_app is not None:
+            return
+        self._webhook_app = aiohttp.web.Application()
+        self._webhook_app.router.add_post(
+            "/maxru-webhook", self._webhook_handler
+        )
+        self._webhook_app.router.add_get("/health", self._health_handler)
+        self._webhook_app.router.add_get("/", self._health_handler)
+        self._webhook_runner = aiohttp.web.AppRunner(self._webhook_app)
+        await self._webhook_runner.setup()
+        self._webhook_site = aiohttp.web.TCPSite(
+            self._webhook_runner,
+            self.webhook_listen_host,
+            self.webhook_listen_port,
+        )
+        try:
+            await self._webhook_site.start()
+            logger.warning(
+                "maxru: webhook listener started on %s:%d",
+                self.webhook_listen_host,
+                self.webhook_listen_port,
+            )
+        except Exception as e:
+            logger.error("maxru: failed to start webhook listener: %s", e)
+            await self._webhook_runner.cleanup()
+            self._webhook_app = None
+            self._webhook_runner = None
+            self._webhook_site = None
+
+    async def _stop_webhook_server(self) -> None:
+        if self._webhook_site:
+            await self._webhook_site.stop()
+            self._webhook_site = None
+        if self._webhook_runner:
+            await self._webhook_runner.cleanup()
+            self._webhook_runner = None
+        self._webhook_app = None
+
+    async def _health_handler(self, request) -> Any:
+        return aiohttp.web.json_response({"status": "ok"})
+
+    async def _webhook_handler(self, request) -> Any:
+        aiohttp = _import_aiohttp()
+        try:
+            body = await request.json()
+        except Exception:
+            return aiohttp.web.json_response(
+                {"error": "invalid json"}, status=400
+            )
+        logger.warning("maxru: webhook update: %r", body)
+        # Run async processing in the gateway's event loop without
+        # blocking the HTTP response.
+        asyncio.create_task(self._process_webhook_update(body))
+        return aiohttp.web.json_response({"ok": True})
+
+    async def _process_webhook_update(self, body: dict) -> None:
+        update_type = body.get("update_type")
+        if update_type != "message_created":
+            await self._handle_update(body)
+            return
+
+        message = body.get("message", {}) or {}
+        body_obj = message.get("body", {}) or {}
+        mid = body_obj.get("mid")
+        # Deduplicate against long polling deliveries.
+        if mid and mid in self._seen_mids:
+            logger.warning("maxru: webhook skipping duplicate mid=%s", mid)
+            return
+        if mid:
+            self._seen_mids.add(mid)
+
+        attachments = body_obj.get("attachments") or []
+        # Reply-linked audio may live inside link.message.attachments.
+        link = message.get("link", {}) or {}
+        if isinstance(link, dict) and link.get("type") == "reply":
+            linked = link.get("message", {}) or {}
+            linked_atts = linked.get("body", {}).get("attachments") or []
+            attachments = list(attachments) + list(linked_atts)
+
+        audio_text = ""
+        for att in attachments:
+            if att.get("type") == "audio":
+                audio_text = await self._transcribe_attachment(att, mid)
+                if audio_text:
+                    break
+
+        # Build a synthetic text message so the core sees the voice content.
+        if audio_text:
+            synthetic = dict(body)
+            synthetic.setdefault("message", {})
+            synthetic["message"] = dict(synthetic["message"])
+            synthetic["message"]["body"] = dict(body_obj)
+            synthetic["message"]["body"]["text"] = audio_text
+            await self._handle_update(synthetic)
+        else:
+            # No audio or transcription failed — fall back to normal text
+            # handling (e.g. a text message delivered via webhook).
+            await self._handle_update(body)
+
+    async def _transcribe_attachment(
+        self, att: dict, message_id: Optional[str]
+    ) -> Optional[str]:
+        aiohttp = _import_aiohttp()
+        payload = att.get("payload", {}) or {}
+        url = payload.get("url")
+        if not url:
+            logger.warning(
+                "maxru: audio attachment has no url; cannot transcribe"
+            )
+            return None
+        try:
+            async with self._session.get(
+                url, timeout=aiohttp.ClientTimeout(total=30)
+            ) as resp:
+                if resp.status != 200:
+                    logger.warning(
+                        "maxru: audio download failed: %s", resp.status
+                    )
+                    return None
+                audio_data = await resp.read()
+        except Exception as e:
+            logger.warning("maxru: audio download error: %s", e)
+            return None
+
+        os.makedirs(_MAXRU_ATT_DIR, exist_ok=True)
+        ts = int(time.time() * 1000)
+        ogg_path = f"{_MAXRU_ATT_DIR}/audio-{ts}.ogg"
+        wav_path = f"{_MAXRU_ATT_DIR}/audio-{ts}.wav"
+        try:
+            with open(ogg_path, "wb") as f:
+                f.write(audio_data)
+            # Convert to 16kHz mono WAV for whisper.
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg",
+                "-y",
+                "-i",
+                ogg_path,
+                "-ar",
+                "16000",
+                "-ac",
+                "1",
+                "-c:a",
+                "pcm_s16le",
+                wav_path,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.wait()
+            if proc.returncode != 0:
+                logger.warning("maxru: ffmpeg failed for voice message")
+                return None
+
+            text = await asyncio.get_event_loop().run_in_executor(
+                None, self._run_whisper, wav_path
+            )
+            if text:
+                logger.warning(
+                    "maxru: transcribed voice message mid=%s: %r",
+                    message_id,
+                    text,
+                )
+            return text or None
+        except Exception as e:
+            logger.warning("maxru: transcription error: %s", e)
+            return None
+        finally:
+            for p in (ogg_path, wav_path):
+                try:
+                    if os.path.exists(p):
+                        os.remove(p)
+                except Exception:
+                    pass
+
+    def _run_whisper(self, wav_path: str) -> str:
+        if self._stt_model is None:
+            import whisper
+
+            logger.warning(
+                "maxru: loading whisper model '%s'...", self.stt_model_name
+            )
+            self._stt_model = whisper.load_model(self.stt_model_name)
+            logger.warning("maxru: whisper model loaded")
+        result = self._stt_model.transcribe(
+            wav_path, language=self.stt_language, fp16=False
+        )
+        return (result.get("text") or "").strip()
 
     async def _register_webhook(self) -> None:
         if not self.webhook_url:
@@ -359,15 +588,32 @@ class MaxruAdapter(BasePlatformAdapter):
                 if not self._session:
                     return
                 lookup_chat_id = self._last_known_chat_id
-                if not lookup_chat_id:
+                # Always park the thin-envelope timestamp first so
+                # that the next full message's flush can resolve it
+                # even if the immediate re-poll below comes back
+                # empty (voice attachments can lag the envelope by
+                # tens of seconds and the API does not surface them
+                # in ``count=1`` queries until they are published).
+                if not hasattr(self, "_pending_voice_ts"):
+                    self._pending_voice_ts: list[int] = []
+                ts = update.get("timestamp")
+                if (
+                    isinstance(ts, (int, float))
+                    and int(ts) not in self._pending_voice_ts
+                ):
+                    self._pending_voice_ts.append(int(ts))
                     logger.warning(
-                        "maxru: cannot resolve thin voice update: "
-                        "no known chat_id yet (wait for a text message first)"
+                        "maxru: parked thin voice update ts=%s "
+                        "(will resolve via /messages flush on next "
+                        "full update)",
+                        ts,
                     )
+                if not lookup_chat_id:
                     return
+                # We have a chat_id — try the immediate re-poll.
                 try:
                     async with self._session.get(
-                        "/messages",
+                        self.api_url + "/messages",
                         params={"chat_id": lookup_chat_id, "count": 1},
                         timeout=aiohttp.ClientTimeout(total=10),
                     ) as resp:
@@ -472,6 +718,117 @@ class MaxruAdapter(BasePlatformAdapter):
                 len(attachment_meta),
                 len(media_urls),
             )
+            # If we parked thin voice updates before we knew our own
+            # chat_id, retry them now that we have one and a session.
+            # The voice attachment may not be visible in /messages
+            # immediately (MAX processes audio async), so we poll with
+            # exponential backoff up to ~20s, looking for any message
+            # with an ``audio`` attachment newer than the parked
+            # timestamp.
+            if (
+                getattr(self, "_pending_voice_ts", None)
+                and self._last_known_chat_id
+                and self._session
+            ):
+                parked = list(self._pending_voice_ts)
+                self._pending_voice_ts = []
+                # The MAX ``/messages`` endpoint accepts a time-window
+                # (``from`` / ``to``) and ``message_ids``. We hit it with
+                # the parked timestamp (minus 30s to be safe — voice
+                # delivery can lag by tens of seconds) on each retry,
+                # polling for up to ~2 minutes with exponential backoff.
+                # This is what the official ``@maxhub/max-bot-api``
+                # client uses, and it is the only documented path to
+                # obtain the full ``message`` object for a thin voice
+                # update.
+                logger.warning(
+                    "maxru: flushing %d parked voice update(s) against "
+                    "chat_id=%s (max wait ~123s)",
+                    len(parked),
+                    self._last_known_chat_id,
+                )
+                from_ts = max(0, min(parked) - 30000)
+                for delay in (1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 60.0):
+                    await asyncio.sleep(delay)
+                    now_ms = int(time.time() * 1000)
+                    try:
+                        async with self._session.get(
+                            self.api_url + "/messages",
+                            params={
+                                "chat_id": self._last_known_chat_id,
+                                "from": from_ts,
+                                "to": now_ms,
+                                "count": 50,
+                            },
+                            timeout=aiohttp.ClientTimeout(total=10),
+                        ) as resp:
+                            if resp.status != 200:
+                                continue
+                            data = await resp.json()
+                            msgs = data.get("messages") or []
+                            for m in msgs:
+                                mbody = m.get("body", {}) or {}
+                                mts = m.get("timestamp")
+                                mtext = mbody.get("text", "")
+                                attachments = (
+                                    mbody.get("attachments") or []
+                                )
+                                has_audio = any(
+                                    (a.get("type") or "").lower()
+                                    == "audio"
+                                    for a in attachments
+                                )
+                                # Match if (a) timestamp is one we
+                                # parked OR (b) it's an empty-text
+                                # message with an audio attachment and
+                                # the timestamp is ≥ the oldest parked
+                                # ts. The empty-text heuristic catches
+                                # the case where MAX assigns a fresh
+                                # timestamp to the resolved voice.
+                                min_parked = min(parked) if parked else 0
+                                ts_match = (
+                                    isinstance(mts, (int, float))
+                                    and int(mts) in parked
+                                )
+                                fresh_audio = (
+                                    has_audio
+                                    and not mtext
+                                    and isinstance(mts, (int, float))
+                                    and int(mts) >= min_parked
+                                )
+                                if ts_match or fresh_audio:
+                                    logger.warning(
+                                        "maxru: parked-voice flush hit: "
+                                        "ts=%s mid=%s text=%r "
+                                        "audio=%d",
+                                        mts,
+                                        mbody.get("mid"),
+                                        mtext,
+                                        sum(
+                                            1
+                                            for a in attachments
+                                            if (a.get("type") or "")
+                                            .lower()
+                                            == "audio"
+                                        ),
+                                    )
+                                    synthetic = {
+                                        "update_type": "message_created",
+                                        "timestamp": mts,
+                                        "user_locale": "ru",
+                                        "message": m,
+                                    }
+                                    await self._handle_update(synthetic)
+                                    # Don't return — the synthetic
+                                    # dispatch is in-flight; the outer
+                                    # flow already completed. We just
+                                    # want to make sure the audio is
+                                    # handled.
+                    except Exception as e:
+                        logger.warning(
+                            "maxru: parked-voice flush attempt failed: %s",
+                            e,
+                        )
 
         elif update_type == "bot_started":
             payload = update.get("payload", "")

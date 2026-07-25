@@ -168,6 +168,12 @@ class MaxruAPIError(Exception):
 class MaxruAdapter(BasePlatformAdapter):
     """MAX.ru Bot API adapter for Hermes."""
 
+    # MAX Bot API text messages are limited to ~4000 UTF-16 code units.
+    MAX_MESSAGE_LENGTH: int = 4000
+    # Use plain len; MAX counts UTF-16 code units, but the gateway already
+    # applies platform-specific length functions when streaming. We keep a
+    # safety margin in the adapter's own chunker as well.
+
     supports_code_blocks = False
     supports_async_delivery = True
     splits_long_messages = False
@@ -1463,7 +1469,34 @@ class MaxruAdapter(BasePlatformAdapter):
             return await self._send_message_payload_with_retry(
                 payload, params=params
             )
-        # Plain text-only path: no race condition possible.
+
+        # MAX text messages have a hard limit around 4000 UTF-16 code units.
+        # Split long plaintext into sequential chunks to avoid truncation.
+        text = payload.get("text", "") or ""
+        if len(text) <= 4000:
+            return await self._send_one_message_payload(payload, params=params)
+
+        results = []
+        chunks = self._chunk_text(text, 4000)
+        for i, chunk in enumerate(chunks):
+            chunk_payload = dict(payload)
+            chunk_payload["text"] = chunk
+            # Only the first chunk keeps reply_to reference.
+            if i > 0:
+                chunk_payload.pop("reply_to_message_id", None)
+            result = await self._send_one_message_payload(chunk_payload, params=params)
+            results.append(result)
+            if not result.success:
+                break
+        # Return last result but mark overall success only if all succeeded.
+        overall = all(r.success for r in results) and bool(results)
+        last = results[-1] if results else SendResult(success=False, error="no chunks")
+        return SendResult(success=overall, message_id=last.message_id, error=last.error)
+
+    async def _send_one_message_payload(
+        self, payload: dict, params: Optional[dict] = None
+    ) -> SendResult:
+        """Send a single payload to ``POST /messages``."""
         try:
             result = await self._api_post("/messages", payload, params=params)
             message_id = (
@@ -1476,6 +1509,29 @@ class MaxruAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.exception("maxru: send failed: %s", e)
             return SendResult(success=False, error=str(e))
+
+    @staticmethod
+    def _chunk_text(text: str, max_len: int) -> list[str]:
+        """Split ``text`` into chunks not exceeding ``max_len`` characters.
+
+        Tries to break on newlines or spaces to keep chunks readable.
+        """
+        if len(text) <= max_len:
+            return [text]
+        chunks = []
+        while text:
+            if len(text) <= max_len:
+                chunks.append(text)
+                break
+            # Look for a newline near the end of the window.
+            cutoff = text.rfind("\n", max_len // 2, max_len)
+            if cutoff == -1:
+                cutoff = text.rfind(" ", max_len // 2, max_len)
+            if cutoff == -1:
+                cutoff = max_len
+            chunks.append(text[:cutoff])
+            text = text[cutoff:].lstrip()
+        return chunks
 
 
     # --------------------------------------------------------------------- #

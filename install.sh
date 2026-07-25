@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PLUGIN_DIR="${HOME}/.hermes/plugins/platforms/maxru"
+PLUGIN_DIR="${HOME}/.hermes/plugins/maxru"
 REPO_URL="https://github.com/m0rtal/hermes-maxru-platform.git"
 
 echo "Installing Hermes MAX.ru platform plugin..."
